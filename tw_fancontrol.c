@@ -70,8 +70,8 @@
 #define get_rev()	(~PINB & IN_REV)
 //FIXME
 #define IN_ADJ		_BV(PINB2)
-#define get_adj()	(ADC_MAX())
-#define ADC_MAX()	(1024)
+#define ADC_ADJ		_BV(ADC1)
+#define ADC_MAX		(1024)
 
 /* DEBUG CODE */
 #if 0
@@ -83,6 +83,7 @@
 
 volatile bool irq_seen;
 volatile int pwm_scaler;
+volatile int prev_adj = ADC_MAX - 1;
 #define stopped() (pwm_scaler == 0)
 
 static inline void debounce(void)
@@ -93,13 +94,88 @@ static inline void debounce(void)
 }
 
 /*
+ * Enable the ADC and start the conversion. The ADC interrupt is used to
+ * detect when it has finished.
+ */
+static inline void start_adc(void)
+{
+	ADCSRA |= _BV(ADEN) | _BV(ADSC) | _BV(ADIE);
+}
+
+/*
+ * Clear ADC enable and the conversion complete interrupt enable
+ */
+static inline void stop_adc(void)
+{
+	ADCSRA &= ~(_BV(ADEN) | _BV(ADIE));
+}
+
+ISR(ADC_vect)
+{
+	stop_adc();
+	sei();
+}
+
+/* ADSC is set to convert and cleared when complete */
+static inline bool adc_busy(void)
+{
+	return ADCSRA & _BV(ADSC);
+}
+
+/*
+ * Poll until the conversion done interrupt fires
+ */
+static int get_adc(void)
+{
+	int delay = 0;
+	int ret = -1;
+	while (delay < 10 && adc_busy()) {
+		_delay_ms(1);
+		delay++;
+	}
+
+	cli();
+	if (!adc_busy()) {
+		/* Must read ADCL first */
+		ret = ADCL;
+		ret |= ADCH << 8;
+	}
+	stop_adc();
+	sei();
+	return ret;
+}
+
+/* Normalizes adc values to use more convenient scaling factors */
+static int normalize_adc(const int adj, const int incr)
+{
+	int i;
+	for (i = 0; i < ADC_MAX; i += incr) {
+		if (adj < i + incr)
+			return i;
+	}
+
+	/* Unreachable */
+	return adj;
+}
+
+static void setup_adc(void)
+{
+	/* Set VREF = VCC */
+	ADMUX = 0;
+
+	/* Set input (ADC1) */
+	ADMUX |= _BV(MUX0);
+	DIDR0 |= _BV(ADC1D);
+}
+
+/*
  * Set TCNT compare and reverse parameters
  * Cleared by stop_count
  *
  * {COMnM1,COMnM0} = 'b10 - Clear on compare match when up counting
  * {COMnM1,COMnM0} = 'b11 - Set on compare match when up counting
  */
-static void start_count(bool fwd)
+static void start_count(const bool fwd)
 {
 	/* Set up compare parameters */
 	if (fwd)
@@ -164,10 +240,21 @@ static void setup_pwm(void)
  * Increments the PWM in whichever direction is specified by the input
  * pin change event.
  */
-static void update_pwm(bool fwd)
+static void update_pwm(const bool fwd)
 {
-	int duty_cycle, scaler;
+	const int adc_incr = 16;
+	int duty_cycle, scaler, adj;
 	bool was_stopped = stopped();
+
+	/* Blocks until conversion done or timeout */
+	adj = get_adc();
+	if (adj > 0) {
+		/* Normalize to rounder values */
+		adj = normalize_adc(adj, adc_incr);
+	} else {
+		/* Timed out. Use previous scaler */
+		adj = prev_adj;
+	}
 
 	/*
 	 * Calculate new duty cycle based on the scaler, so that we can
@@ -177,7 +264,8 @@ static void update_pwm(bool fwd)
 	 */
 	cli();
 	scaler = pwm_scaler + (fwd ? 1 : -1);
-	duty_cycle = scaler * SCALER_INCR * get_adj() / ADC_MAX();
+	duty_cycle = scaler * SCALER_INCR * adj / ADC_MAX;
+	prev_adj = adj;
 	sei();
 
 	/* Catch PWM overflow */
@@ -226,6 +314,9 @@ static void handle_irq(void)
 	bool fwd = get_fwd();
 	bool rev = get_rev();
 
+	/* The ADC takes a few cycles, so start it early */
+	start_adc();
+
 	/*
 	 * The pin change interrupts need to be debounced in software to
 	 * prevent multiple updates. This is done by checking the pin
@@ -263,11 +354,6 @@ static void setup_portb(void)
 	DDRB |= OUT_FWD | OUT_REV;
 }
 
-static void setup_sleep(int mode)
-{
-	set_sleep_mode(mode);
-}
-
 static inline void relax(void)
 {
 	cli();
@@ -281,6 +367,7 @@ int main(void)
 {
 	setup_portb();
 	setup_pwm();
+	setup_adc();
 	setup_irq();
 
 	/* The uC will remain in a low power mode until a pin change
@@ -288,7 +375,7 @@ int main(void)
 	 * scheduled work, the uC will power back down to the low power
 	 * mode.
 	 */
-	setup_sleep(SLEEP_MODE_PWR_DOWN);
+	set_sleep_mode(SLEEP_MODE_PWR_DOWN);
 	while (1) {
 		if (irq_seen) {
 			handle_irq();
