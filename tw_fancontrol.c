@@ -4,8 +4,14 @@
  * Controls an h-bridge using PWM
  * Grounding an IN pin will trigger an increase in the forward or
  * reverse duty cycle. Tuning the max duty cycle is done with the
- * trimpot connected to an ADC pin. The microcontroller will sleep until
- * a pin change interrupt is thrown.
+ * trimpot connected to an ADC pin.
+ *
+ * This circuit may go very long times between use, so the
+ * microcontroller must use very little power when not driving the fan.
+ * The microcontroller's sleep mode is enabled when not changing state,
+ * and coming out of sleep mode is entirely interrupt driver by the pin
+ * change interrupt. PWM is accomplished in hardware and the ADC is only
+ * polled when changing the PWM duty cycle.
  *
  * Copyright (c) 2016, Jon Derrick
  *
@@ -21,7 +27,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+ * 02110-1301, USA.
  */
 
 #include <stdlib.h>
