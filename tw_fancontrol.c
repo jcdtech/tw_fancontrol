@@ -1,10 +1,23 @@
 /*
- * AVR 2-wire Fan Controller
+ * AVR Two/Three-Wire (TW) Fan Controller
  *
  * Controls an h-bridge using PWM
+ *
  * Grounding an IN pin will trigger an increase in the forward or
  * reverse duty cycle. Tuning the max duty cycle is done with the
  * trimpot connected to an ADC pin.
+ *
+ * In Two-Wire Mode:
+ * Two-wire fans are bi-directional and can be controlled through PWM.
+ * An H-bridge is used to control the fan direction, and PWM is applied
+ * at each H-bridge half to control the duty cycle of the fan.
+ *
+ * In Three-Wire Mode:
+ * Three-wire fans use two wires for Power and Ground, and a third for
+ * PWM. TW Fan Controller uses the first PWM OUT to the H-Bridge as a
+ * hard enable/disable for the FAN, and uses the second PWM OUT as the
+ * control to the PWM wire. The fan cannot be reversed in this
+ * configuration, but will still operate up to max and down to 0.
  *
  * This circuit may go very long times between use, so the
  * microcontroller must use very little power when not driving the fan.
@@ -45,14 +58,18 @@
 /* The base PWM increment value relative to COUNT_TOP (0xFF) */
 #define SCALER_INCR 15
 
-/* Output PWM pin logic level behavior for motor driver */
+/*
+ * Output PWM pin logic level behavior for motor driver. In case you end
+ * up on an inverted pin or using a motor driver with a different truth
+ * table.
+ */
 #define OUT_FWD_ACTIVE_HIGH 1
 #define OUT_REV_ACTIVE_HIGH 1
 
 #if OUT_FWD_ACTIVE_HIGH
-#define FWD_MASK _BV(COM0B1)
+#define FWD_MASK _BV(COM1B1)
 #else
-#define FWD_MASK (_BV(COM0B1) | _BV(COM0B0))
+#define FWD_MASK (_BV(COM1B1) | _BV(COM1B0))
 #endif
 
 #if OUT_REV_ACTIVE_HIGH
@@ -63,28 +80,26 @@
 
 /* Alias the pins for convenience */
 #define IN_FWD		_BV(PINB3)
-#define IN_REV		_BV(PINB4)
-#define OUT_FWD		_BV(PINB1)
+#define IN_REV		_BV(PINB1)
+#define OUT_FWD		_BV(PINB4)
 #define OUT_REV		_BV(PINB0)
 #define get_fwd()	(~PINB & IN_FWD)
 #define get_rev()	(~PINB & IN_REV)
-//FIXME
-#define IN_ADJ		_BV(PINB2)
-#define ADC_ADJ		_BV(ADC1)
-#define ADC_MAX		(1024)
 
-/* DEBUG CODE */
-#if 0
-	bool is_on = true;
-	#define OFF() do { PORTB |= (OUT_FWD | OUT_REV); } while(0)
-	#define ON() do { PORTB &= ~(OUT_FWD | OUT_REV); } while(0)
-	#define INV() do { if (is_on) OFF(); else ON(); is_on = !is_on; } while(0)
-#endif
+/* ADC specific functions */
+#define IN_ADJ		_BV(PINB2)
+#define IN_MODE		_BV(PINB4)
+#define ADC_ADJ		_BV(ADC1)
+#define ADC_MODE	_BV(ADC2)
+#define ADC_MAX		(1024) //FIXME: find a platform macro
+
+/* Output compare registers */
+#define FWD_OC OCR1B
+#define REV_OC OCR0B
 
 volatile bool irq_seen;
 volatile int pwm_scaler;
 volatile int prev_adj = ADC_MAX - 1;
-#define stopped() (pwm_scaler == 0)
 
 static inline void debounce(void)
 {
@@ -97,7 +112,7 @@ static inline void debounce(void)
  * Enable the ADC and start the conversion. The ADC interrupt is used to
  * detect when it has finished.
  */
-static inline void start_adc(void)
+static inline void start_adj_adc(void)
 {
 	ADCSRA |= _BV(ADEN) | _BV(ADSC) | _BV(ADIE);
 }
@@ -105,19 +120,21 @@ static inline void start_adc(void)
 /*
  * Clear ADC enable and the conversion complete interrupt enable
  */
-static inline void stop_adc(void)
+static inline void stop_adj_adc(void)
 {
 	ADCSRA &= ~(_BV(ADEN) | _BV(ADIE));
 }
 
 ISR(ADC_vect)
 {
-	stop_adc();
+	stop_adj_adc();
 	sei();
 }
 
-/* ADSC is set to convert and cleared when complete */
-static inline bool adc_busy(void)
+/*
+ * Set ADSC to start converting and it will be cleared when complete
+ */
+static inline bool adj_adc_busy(void)
 {
 	return ADCSRA & _BV(ADSC);
 }
@@ -125,28 +142,30 @@ static inline bool adc_busy(void)
 /*
  * Poll until the conversion done interrupt fires
  */
-static int get_adc(void)
+static int get_adj_adc(void)
 {
 	int delay = 0;
 	int ret = -1;
-	while (delay < 10 && adc_busy()) {
+	while (delay < 10 && adj_adc_busy()) {
 		_delay_ms(1);
 		delay++;
 	}
 
 	cli();
-	if (!adc_busy()) {
+	if (!adj_adc_busy()) {
 		/* Must read ADCL first */
 		ret = ADCL;
 		ret |= ADCH << 8;
 	}
-	stop_adc();
+	stop_adj_adc();
 	sei();
 	return ret;
 }
 
-/* Normalizes adc values to use more convenient scaling factors */
-static int normalize_adc(const int adj, const int incr)
+/*
+ * Normalizes adc values to use more convenient scaling factors
+ */
+static int normalize_adj_adc(const int adj, const int incr)
 {
 	int i;
 	for (i = 0; i < ADC_MAX; i += incr) {
@@ -158,7 +177,7 @@ static int normalize_adc(const int adj, const int incr)
 	return adj;
 }
 
-static void setup_adc(void)
+static void setup_adj_adc(void)
 {
 	/* Set VREF = VCC */
 	ADMUX = 0;
@@ -170,26 +189,38 @@ static void setup_adc(void)
 
 /*
  * Set TCNT compare and reverse parameters
- * Cleared by stop_count
  *
- * {COMnM1,COMnM0} = 'b10 - Clear on compare match when up counting
- * {COMnM1,COMnM0} = 'b11 - Set on compare match when up counting
+ * {COM1M1,COM1M0} = 'b10 - Clear on compare match. Set at 0
+ * {COM1M1,COM1M0} = 'b11 - Set on compare match. Clear on 0
+ * {COM0M1,COM0M0} = 'b10 - Clear on compare match when up counting
+ *                          Set on compare match when down counting
+ * {COM0M1,COM0M0} = 'b11 - Set on compare match when up counting
+ *                          Clear on compare match when down counting
  */
 static void start_count(const bool fwd)
 {
-	/* Set up compare parameters */
+	/*
+	 * Set up compare parameters
+ 	 * Cleared by stop_count
+ 	 */
 	if (fwd)
-		TCCR0A |= FWD_MASK;
+		GTCCR |= FWD_MASK;
 	else
 		TCCR0A |= REV_MASK;
 
 	/* Set up counter prescaler and start count */
 #ifdef DEBUG_SIMULATOR
 	/* 1/1 */
-	TCCR0B |= _BV(CS00);
+	if (fwd)
+		TCCR1 |= _BV(CS10);
+	else
+		TCCR0B |= _BV(CS00);
 #else
 	/* 1/64 */
-	TCCR0B |= _BV(CS01) | _BV(CS00);
+	if (fwd)
+		TCCR1 |= _BV(CS12) | _BV(CS11) | _BV(CS10);
+	else
+		TCCR0B |= _BV(CS01) | _BV(CS00);
 #endif
 }
 
@@ -197,7 +228,7 @@ static void start_count(const bool fwd)
  * Clears outputs to the motor driver by setting their values to the
  * driver's 'off' logic level.
  */
-static void clear_out()
+static void clear_outputs()
 {
 #if OUT_FWD_ACTIVE_HIGH
 	PORTB &= ~OUT_FWD;
@@ -217,9 +248,20 @@ static void clear_out()
  */
 static void stop_count(void)
 {
-	clear_out();
-	TCCR0A &= ~(FWD_MASK | REV_MASK);
+	clear_outputs();
+
+	/* Clear forward counter and compare parameters */
+	GTCCR &= ~FWD_MASK;
+	TCCR1 &= ~(_BV(CS13) | _BV(CS12) | _BV(CS11) | _BV(CS10));
+
+	/* Clear reverse counter and compare parameters */
+	TCCR0A &= ~REV_MASK;
 	TCCR0B &= ~(_BV(CS02) | _BV(CS01) | _BV(CS00));
+}
+
+static inline bool is_stopped(void)
+{
+	return pwm_scaler == 0;
 }
 
 /*
@@ -229,11 +271,31 @@ static void stop_count(void)
  * determined by the values of the compare match registers (OCRnM) and
  * the action to perform on compare match (TCCR0A:{COMnM1,COMnM0}).
  */
-static void setup_pwm(void)
+static void setup_tcnt0_pwm(void)
 {
 	/* Phase correct, max 0xFF */
 	TCCR0A |= _BV(WGM00);
-	clear_out();
+}
+
+/*
+ * Sets up Counter 1 PWM mode with a 'TOP' value of 0xFF. In this mode,
+ * the counter will count up to TOP and clear itself. The duty cycle of
+ * the OCn pins are determined by the values of the compare match
+ * registers (OCRnM) and the action to perform on TCNT reset (OCRnC),
+ * and the action to perform on compare match GTCCR:{COMnM1,COMnM0}).
+ */
+static void setup_tcnt1_pwm(void)
+{
+	/* Count to OCR1C and reset */
+	GTCCR |= _BV(PWM1B);
+	OCR1C = 0xFF;
+}
+
+static void setup_pwm(void)
+{
+	setup_tcnt0_pwm();
+	setup_tcnt1_pwm();
+	clear_outputs();
 }
 
 /*
@@ -244,13 +306,13 @@ static void update_pwm(const bool fwd)
 {
 	const int adc_incr = 16;
 	int duty_cycle, scaler, adj;
-	bool was_stopped = stopped();
+	bool was_stopped = is_stopped();
 
 	/* Blocks until conversion done or timeout */
-	adj = get_adc();
+	adj = get_adj_adc();
 	if (adj > 0) {
 		/* Normalize to rounder values */
-		adj = normalize_adc(adj, adc_incr);
+		adj = normalize_adj_adc(adj, adc_incr);
 	} else {
 		/* Timed out. Use previous scaler */
 		adj = prev_adj;
@@ -276,17 +338,17 @@ static void update_pwm(const bool fwd)
 	cli();
 	pwm_scaler = scaler;
 	if (pwm_scaler >= 0) {
-		OCR0A = duty_cycle;
-		OCR0B = 0;
+		FWD_OC = duty_cycle;
+		REV_OC = 0;
 	} else {
-		OCR0A = 0;
-		OCR0B = -duty_cycle;
+		FWD_OC = 0;
+		REV_OC = -duty_cycle;
 	}
 
 	/* Detect stop->start and start->stop transitions */
 	if (was_stopped)
 		start_count(pwm_scaler > 0);
-	else if (stopped())
+	else if (is_stopped())
 		stop_count();
 
 	sei();
@@ -315,7 +377,7 @@ static void handle_irq(void)
 	bool rev = get_rev();
 
 	/* The ADC takes a few cycles, so start it early */
-	start_adc();
+	start_adj_adc();
 
 	/*
 	 * The pin change interrupts need to be debounced in software to
@@ -333,7 +395,7 @@ static void handle_irq(void)
 	irq_seen = false;
 
 	/* Stall 'button hold' behavior when switching directions */
-	if (stopped()) {
+	if (is_stopped()) {
 		_delay_ms(2000);
 		return;
 	}
@@ -354,6 +416,24 @@ static void setup_portb(void)
 	DDRB |= OUT_FWD | OUT_REV;
 }
 
+#if 0 /* For 2w/3w mode selection */
+static void setup_mode_adc(void)
+{
+	/* Set VREF = VCC */
+	ADMUX = 0;
+
+	/* Set input (ADC2) */
+	ADMUX |= _BV(MUX1);
+	DIDR0 |= _BV(ADC2D);
+}
+
+static void release_mode_adc(void)
+{
+	ADMUX &= ~_BV(MUX1);
+	DIDR0 &= ~_BV(ADC2D);
+}
+#endif
+
 static inline void relax(void)
 {
 	cli();
@@ -367,7 +447,7 @@ int main(void)
 {
 	setup_portb();
 	setup_pwm();
-	setup_adc();
+	setup_adj_adc();
 	setup_irq();
 
 	/* The uC will remain in a low power mode until a pin change
