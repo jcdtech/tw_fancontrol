@@ -92,6 +92,7 @@
 #define ADC_ADJ		_BV(ADC1)
 #define ADC_MODE	_BV(ADC2)
 #define ADC_MAX		(1024)
+#define ADC_MODE_THRESH	(ADC_MAX * 8/10)
 /* Normalization granularity */
 #define ADJ_ADC_GRAN	(16)
 
@@ -471,8 +472,7 @@ static void setup_portb(void)
 	DDRB |= OUT_FWD | OUT_REV;
 }
 
-#if 0 /* For 2w/3w mode selection */
-static void setup_mode_adc(void)
+static inline void setup_mode_adc(void)
 {
 	/* Set VREF = VCC */
 	ADMUX = 0;
@@ -480,14 +480,56 @@ static void setup_mode_adc(void)
 	/* Set input (ADC2) */
 	ADMUX |= _BV(MUX1);
 	DIDR0 |= _BV(ADC2D);
+
+	/* Set internal pull-up */
+	PORTB |= OUT_FWD;
 }
 
-static void release_mode_adc(void)
+/*
+ * Start ADC conversion without the interrupt enabled. At this point, we
+ * can just rely on polling the ADC. We would normally want to set up
+ * the interrupt and sleep, but this is only done on startup so the
+ * overhead is negligible. Remember that we are probably going to be
+ * powered for long periods of time, but sleeping between actions.
+ */
+static inline void start_mode_adc(void)
+{
+	ADCSRA |= _BV(ADEN) | _BV(ADSC);
+}
+
+static inline void release_mode_adc(void)
 {
 	ADMUX &= ~_BV(MUX1);
 	DIDR0 &= ~_BV(ADC2D);
+	PORTB &= ~OUT_FWD;
 }
-#endif
+
+/*
+ * Mode is selected by soldering the jumper that connects OUT_FWD to a
+ * resistor to ground. We temporarily use this pin as an input. With the
+ * internal pull-up resistor, the ADC will detect a voltage divider and
+ * this selects Three-Wire mode. If the solder jumper is not jumped, the
+ * ADC will read near MAX due to the pull-up, and Two-Wire mode is
+ * selected.
+ *
+ * In Two-Wire mode, this pin is doing PWM and won't be affected by the
+ * external resistor, because the jumper connecting them is not
+ * soldered. In Three-Wire mode, this pin is used as a hard enable, and
+ * won't be affected by the weak external resistor.
+ */
+static enum MODE early_detect_mode(void) { enum MODE mode = TWO_WIRE;
+
+	setup_mode_adc();
+	start_mode_adc();
+	while (adc_busy())
+		;
+
+	if (read_adc() < ADC_MODE_THRESH)
+		mode = THREE_WIRE;
+
+	release_mode_adc();
+	return mode;
+}
 
 static inline void relax(void)
 {
@@ -498,7 +540,6 @@ static inline void relax(void)
 	sleep_disable();
 }
 
-#define early_detect_mode() (TWO_WIRE) //FIXME
 int main(void)
 {
 	enum MODE mode = early_detect_mode();
