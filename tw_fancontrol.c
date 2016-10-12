@@ -1,7 +1,7 @@
 /*
  * AVR Two/Three-Wire (TW) Fan Controller
  *
- * Controls an h-bridge using PWM
+ * Controls an H-Bridge using PWM
  *
  * Grounding an IN pin will trigger an increase in the forward or
  * reverse duty cycle. Tuning the max duty cycle is done with the
@@ -9,8 +9,8 @@
  *
  * In Two-Wire Mode:
  * Two-wire fans are bi-directional and can be controlled through PWM.
- * An H-bridge is used to control the fan direction, and PWM is applied
- * at each H-bridge half to control the duty cycle of the fan.
+ * An H-Bridge is used to control the fan direction, and PWM is applied
+ * at each H-Bridge half to control the duty cycle of the fan.
  *
  * In Three-Wire Mode:
  * Three-wire fans use two wires for Power and Ground, and a third for
@@ -91,11 +91,18 @@
 #define IN_MODE		_BV(PINB4)
 #define ADC_ADJ		_BV(ADC1)
 #define ADC_MODE	_BV(ADC2)
-#define ADC_MAX		(1024) //FIXME: find a platform macro
+#define ADC_MAX		(1024)
+/* Normalization granularity */
+#define ADJ_ADC_GRAN	(16)
 
 /* Output compare registers */
 #define FWD_OC OCR1B
 #define REV_OC OCR0B
+
+enum MODE {
+	TWO_WIRE,
+	THREE_WIRE,
+};
 
 volatile bool irq_seen;
 volatile int pwm_scaler;
@@ -106,6 +113,39 @@ static inline void debounce(void)
 #ifndef DEBUG_SIMULATOR
 	_delay_ms(100);
 #endif
+}
+
+static inline unsigned int read_adc(void)
+{
+	unsigned int ret;
+
+	/* Must read ADCL first */
+	ret = ADCL;
+	ret |= ADCH << 8;
+	return ret;
+}
+
+/*
+ * ADSC is cleared when complete
+ */
+static inline bool adc_busy(void)
+{
+	return ADCSRA & _BV(ADSC);
+}
+
+/*
+ * Normalizes adc values to use more convenient scaling factors
+ */
+static int normalize_adc(const int raw, const int gran, const int max)
+{
+	int i;
+	for (i = 0; i < max; i += gran) {
+		if (raw < i + gran)
+			return i;
+	}
+
+	/* Unreachable */
+	return raw;
 }
 
 /*
@@ -132,49 +172,25 @@ ISR(ADC_vect)
 }
 
 /*
- * Set ADSC to start converting and it will be cleared when complete
- */
-static inline bool adj_adc_busy(void)
-{
-	return ADCSRA & _BV(ADSC);
-}
-
-/*
  * Poll until the conversion done interrupt fires
  */
 static int get_adj_adc(void)
 {
 	int delay = 0;
 	int ret = -1;
-	while (delay < 10 && adj_adc_busy()) {
+	while (delay < 10 && adc_busy()) {
+#ifndef DEBUG_SIMULATOR
 		_delay_ms(1);
 		delay++;
+#endif
 	}
 
 	cli();
-	if (!adj_adc_busy()) {
-		/* Must read ADCL first */
-		ret = ADCL;
-		ret |= ADCH << 8;
-	}
+	if (!adc_busy())
+		ret = read_adc();
 	stop_adj_adc();
 	sei();
 	return ret;
-}
-
-/*
- * Normalizes adc values to use more convenient scaling factors
- */
-static int normalize_adj_adc(const int adj, const int incr)
-{
-	int i;
-	for (i = 0; i < ADC_MAX; i += incr) {
-		if (adj < i + incr)
-			return i;
-	}
-
-	/* Unreachable */
-	return adj;
 }
 
 static void setup_adj_adc(void)
@@ -188,8 +204,6 @@ static void setup_adj_adc(void)
 }
 
 /*
- * Set TCNT compare and reverse parameters
- *
  * {COM1M1,COM1M0} = 'b10 - Clear on compare match. Set at 0
  * {COM1M1,COM1M0} = 'b11 - Set on compare match. Clear on 0
  * {COM0M1,COM0M0} = 'b10 - Clear on compare match when up counting
@@ -197,30 +211,36 @@ static void setup_adj_adc(void)
  * {COM0M1,COM0M0} = 'b11 - Set on compare match when up counting
  *                          Clear on compare match when down counting
  */
-static void start_count(const bool fwd)
+static void setup_compare_params(const enum MODE mode, const bool fwd)
 {
 	/*
-	 * Set up compare parameters
- 	 * Cleared by stop_count
- 	 */
-	if (fwd)
+	 * In Two-Wire mode, we use Counter 0 and 1 to regulate the
+	 * reverse and forward PWM behavior.
+	 *
+	 * In Three-Wire mode, The 'Forward' Pin is used as a hard
+	 * enable and the 'Reverse' Pin is used for the PWM. Counter 0
+	 * is mapped to the 'Reverse'/PWM_OUT pin, so only enable
+	 * Counter 0 for this operation.
+	 */
+	if (fwd && mode == TWO_WIRE)
 		GTCCR |= FWD_MASK;
-	else
+	else /* !fwd && TWO_WIRE || fwd && THREE_WIRE */
 		TCCR0A |= REV_MASK;
+}
 
-	/* Set up counter prescaler and start count */
-#ifdef DEBUG_SIMULATOR
-	/* 1/1 */
-	if (fwd)
-		TCCR1 |= _BV(CS10);
-	else
-		TCCR0B |= _BV(CS00);
+static inline void clear_compare_params(void)
+{
+	GTCCR &= ~FWD_MASK;
+	TCCR0A &= ~REV_MASK;
+}
+
+/* Only for Three-Wire mode */
+static inline void set_out_fwd(void)
+{
+#if OUT_FWD_ACTIVE_HIGH
+	PORTB |= OUT_FWD;
 #else
-	/* 1/64 */
-	if (fwd)
-		TCCR1 |= _BV(CS12) | _BV(CS11) | _BV(CS10);
-	else
-		TCCR0B |= _BV(CS01) | _BV(CS00);
+	PORTB &= ~OUT_FWD;
 #endif
 }
 
@@ -228,7 +248,7 @@ static void start_count(const bool fwd)
  * Clears outputs to the motor driver by setting their values to the
  * driver's 'off' logic level.
  */
-static void clear_outputs()
+static inline void clear_outputs(void)
 {
 #if OUT_FWD_ACTIVE_HIGH
 	PORTB &= ~OUT_FWD;
@@ -244,18 +264,43 @@ static void clear_outputs()
 }
 
 /*
+ * Set TCNT compare match, reverse, and PWM frequency parameters
+ * As soon as the frequency parameters are set, the counters will start
+ * counting. They are stopped by stop_count
+ */
+static void start_count_and_enable(const enum MODE mode, const bool fwd)
+{
+	if (mode == THREE_WIRE)
+		set_out_fwd();
+
+	/* Set up counter prescaler and start count */
+#ifdef DEBUG_SIMULATOR
+	/* 1/1 */
+	if (fwd && mode == TWO_WIRE)
+		TCCR1 |= _BV(CS10);
+	else /* !fwd && TWO_WIRE || fwd && THREE_WIRE */
+		TCCR0B |= _BV(CS00);
+#else
+	/* 1/64 */
+	if (fwd && mode == TWO_WIRE)
+		TCCR1 |= _BV(CS12) | _BV(CS11) | _BV(CS10);
+	else /* !fwd && TWO_WIRE || fwd && THREE_WIRE */
+		TCCR0B |= _BV(CS01) | _BV(CS00);
+#endif
+}
+
+/*
  * Sets motor driver 'off' logic level and stops the counters
  */
-static void stop_count(void)
+static void stop_count_and_disable(const enum MODE mode)
 {
 	clear_outputs();
 
-	/* Clear forward counter and compare parameters */
-	GTCCR &= ~FWD_MASK;
-	TCCR1 &= ~(_BV(CS13) | _BV(CS12) | _BV(CS11) | _BV(CS10));
+	/* Stop forward counter */
+	if (mode == TWO_WIRE)
+		TCCR1 &= ~(_BV(CS13) | _BV(CS12) | _BV(CS11) | _BV(CS10));
 
-	/* Clear reverse counter and compare parameters */
-	TCCR0A &= ~REV_MASK;
+	/* Stop reverse counter (forward in Three-Wire mode) */
 	TCCR0B &= ~(_BV(CS02) | _BV(CS01) | _BV(CS00));
 }
 
@@ -271,7 +316,7 @@ static inline bool is_stopped(void)
  * determined by the values of the compare match registers (OCRnM) and
  * the action to perform on compare match (TCCR0A:{COMnM1,COMnM0}).
  */
-static void setup_tcnt0_pwm(void)
+static inline void setup_tcnt0_pwm(void)
 {
 	/* Phase correct, max 0xFF */
 	TCCR0A |= _BV(WGM00);
@@ -284,7 +329,7 @@ static void setup_tcnt0_pwm(void)
  * registers (OCRnM) and the action to perform on TCNT reset (OCRnC),
  * and the action to perform on compare match GTCCR:{COMnM1,COMnM0}).
  */
-static void setup_tcnt1_pwm(void)
+static inline void setup_tcnt1_pwm(void)
 {
 	/* Count to OCR1C and reset */
 	GTCCR |= _BV(PWM1B);
@@ -302,9 +347,8 @@ static void setup_pwm(void)
  * Increments the PWM in whichever direction is specified by the input
  * pin change event.
  */
-static void update_pwm(const bool fwd)
+static void update_pwm(const enum MODE mode, const bool fwd)
 {
-	const int adc_incr = 16;
 	int duty_cycle, scaler, adj;
 	bool was_stopped = is_stopped();
 
@@ -312,7 +356,7 @@ static void update_pwm(const bool fwd)
 	adj = get_adj_adc();
 	if (adj > 0) {
 		/* Normalize to rounder values */
-		adj = normalize_adj_adc(adj, adc_incr);
+		adj = normalize_adc(adj, ADJ_ADC_GRAN, ADC_MAX);
 	} else {
 		/* Timed out. Use previous scaler */
 		adj = prev_adj;
@@ -320,12 +364,15 @@ static void update_pwm(const bool fwd)
 
 	/*
 	 * Calculate new duty cycle based on the scaler, so that we can
-	 * always return to 0. The scaler and duty cycle are positive
-	 * when in the forward direction and negative when in the
-	 * reverse direction.
+	 * always return to 0. In two-wire mode, the scaler and duty
+	 * cycle are positive when in the forward direction and negative
+	 * when in the reverse direction. In three-wire mode, the scaler
+	 * and duty cycle are always positive.
 	 */
 	cli();
 	scaler = pwm_scaler + (fwd ? 1 : -1);
+	if (mode == THREE_WIRE && scaler < 0)
+		scaler = 0;
 	duty_cycle = scaler * SCALER_INCR * adj / ADC_MAX;
 	prev_adj = adj;
 	sei();
@@ -337,19 +384,27 @@ static void update_pwm(const bool fwd)
 	/* Increment the scaler and set PWM compare match values */
 	cli();
 	pwm_scaler = scaler;
-	if (pwm_scaler >= 0) {
-		FWD_OC = duty_cycle;
-		REV_OC = 0;
+	if (mode == TWO_WIRE) {
+		if (pwm_scaler >= 0) {
+			FWD_OC = duty_cycle;
+			REV_OC = 0;
+		} else {
+			FWD_OC = 0;
+			REV_OC = -duty_cycle;
+		}
 	} else {
-		FWD_OC = 0;
-		REV_OC = -duty_cycle;
+		/* Three-Wire */
+		REV_OC = duty_cycle;
 	}
 
 	/* Detect stop->start and start->stop transitions */
-	if (was_stopped)
-		start_count(pwm_scaler > 0);
-	else if (is_stopped())
-		stop_count();
+	if (was_stopped) {
+		setup_compare_params(mode, fwd);
+		start_count_and_enable(mode, pwm_scaler > 0);
+	} else if (is_stopped()) {
+		stop_count_and_disable(mode);
+		clear_compare_params();
+	}
 
 	sei();
 }
@@ -371,7 +426,7 @@ static void setup_irq(void)
 	sei();
 }
 
-static void handle_irq(void)
+static void handle_irq(const enum MODE mode)
 {
 	bool fwd = get_fwd();
 	bool rev = get_rev();
@@ -386,9 +441,9 @@ static void handle_irq(void)
 	 */
 	debounce();
 	if (fwd && get_fwd())
-		update_pwm(1);
+		update_pwm(mode, 1);
 	else if (rev && get_rev())
-		update_pwm(0);
+		update_pwm(mode, 0);
 
 	/* Re-enable the pin change interrupt */
 	GIMSK |= _BV(PCIE);
@@ -443,8 +498,11 @@ static inline void relax(void)
 	sleep_disable();
 }
 
+#define early_detect_mode() (TWO_WIRE) //FIXME
 int main(void)
 {
+	enum MODE mode = early_detect_mode();
+
 	setup_portb();
 	setup_pwm();
 	setup_adj_adc();
@@ -458,7 +516,7 @@ int main(void)
 	set_sleep_mode(SLEEP_MODE_PWR_DOWN);
 	while (1) {
 		if (irq_seen) {
-			handle_irq();
+			handle_irq(mode);
 		}
 		relax();
 	}
