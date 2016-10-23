@@ -7,36 +7,36 @@
  * reverse duty cycle. Tuning the max duty cycle is done with the
  * trimpot connected to an ADC pin.
  *
- * In Two-Wire Mode:
- * Two-wire fans are bi-directional and can be controlled through PWM.
- * An H-Bridge is used to control the fan direction, and PWM is applied
- * at each H-Bridge half to control the duty cycle of the fan.
+ * In Two-Wire Mode: Two-wire fans are bi-directional and can be
+ * controlled through PWM. An H-Bridge is used to control the fan
+ * direction, and PWM is applied at each H-Bridge half to control the
+ * duty cycle of the fan.
  *
- * In Three-Wire Mode:
- * Three-wire fans use two wires for Power and Ground, and a third for
- * PWM. TW Fan Controller uses the first PWM OUT to the H-Bridge as a
- * hard enable/disable for the FAN, and uses the second PWM OUT as the
- * control to the PWM wire. The fan cannot be reversed in this
- * configuration, but will still operate up to max and down to 0.
+ * In Three-Wire Mode: Three-wire fans use two wires for Power and
+ * Ground, and a third for PWM. TW Fan Controller uses the first PWM OUT
+ * to the H-Bridge as a hard enable/disable for the FAN, and uses the
+ * second PWM OUT as the control to the PWM wire. The fan cannot be
+ * reversed in this configuration, but will still operate up to max and
+ * down to 0.
  *
  * This circuit may go very long times between use, so the
  * microcontroller must use very little power when not driving the fan.
- * The microcontroller's sleep mode is enabled when not changing state,
- * and coming out of sleep mode is entirely interrupt driver by the pin
+ * The microcontroller's sleep mode is enabled when not driving, and
+ * coming out of sleep mode is entirely interrupt driver by the pin
  * change interrupt. PWM is accomplished in hardware and the ADC is only
  * polled when changing the PWM duty cycle.
  *
  * Copyright (c) 2016, Jon Derrick
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or (at
+ * your option) any later version.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
@@ -55,7 +55,7 @@
 
 //#define DEBUG_SIMULATOR
 
-/* The base PWM increment value relative to COUNT_TOP (0xFF) */
+/* The base PWM increment value relative to COUNT_TOP (0xFF (PWM_MAX)) */
 #define SCALER_INCR 15
 
 /*
@@ -92,13 +92,14 @@
 #define ADC_ADJ		_BV(ADC1)
 #define ADC_MODE	_BV(ADC2)
 #define ADC_MAX		(1024)
-#define ADC_MODE_THRESH	(ADC_MAX * 8/10)
+#define ADC_MODE_THRESH	(ADC_MAX / 2)
 /* Normalization granularity */
 #define ADJ_ADC_GRAN	(16)
 
 /* Output compare registers */
 #define FWD_OC OCR1B
-#define REV_OC OCR0B
+#define REV_OC OCR0A
+#define PWM_MAX 0xFF
 
 enum MODE {
 	TWO_WIRE,
@@ -107,7 +108,7 @@ enum MODE {
 
 volatile bool irq_seen;
 volatile int pwm_scaler;
-volatile int prev_adj = ADC_MAX - 1;
+volatile int prev_adj = ADC_MAX;
 
 static inline void debounce(void)
 {
@@ -140,6 +141,10 @@ static inline bool adc_busy(void)
 static int normalize_adc(const int raw, const int gran, const int max)
 {
 	int i;
+
+	if (raw > ADC_MAX)
+		return ADC_MAX;
+
 	for (i = 0; i < max; i += gran) {
 		if (raw < i + gran)
 			return i;
@@ -189,6 +194,7 @@ static int get_adj_adc(void)
 	cli();
 	if (!adc_busy())
 		ret = read_adc();
+
 	stop_adj_adc();
 	sei();
 	return ret;
@@ -312,29 +318,30 @@ static inline bool is_stopped(void)
 
 /*
  * Sets up Counter 0 in phase-correct PWM mode with a 'TOP' value of
- * 0xFF. In this mode, the counter will count up to TOP and reverse
- * direction, counting down. The duty cycle of the OCn pins are
+ * 0xFF (PWM_MAX). In this mode, the counter will count up to TOP and
+ * reverse direction, counting down. The duty cycle of the OCn pins are
  * determined by the values of the compare match registers (OCRnM) and
  * the action to perform on compare match (TCCR0A:{COMnM1,COMnM0}).
  */
 static inline void setup_tcnt0_pwm(void)
 {
-	/* Phase correct, max 0xFF */
+	/* Phase correct, max 0xFF (PWM_MAX) */
 	TCCR0A |= _BV(WGM00);
 }
 
 /*
- * Sets up Counter 1 PWM mode with a 'TOP' value of 0xFF. In this mode,
- * the counter will count up to TOP and clear itself. The duty cycle of
- * the OCn pins are determined by the values of the compare match
- * registers (OCRnM) and the action to perform on TCNT reset (OCRnC),
- * and the action to perform on compare match GTCCR:{COMnM1,COMnM0}).
+ * Sets up Counter 1 PWM mode with a 'TOP' value of 0xFF (PWM_MAX). In
+ * this mode, the counter will count up to TOP and clear itself. The
+ * duty cycle of the OCn pins are determined by the values of the
+ * compare match registers (OCRnM) and the action to perform on TCNT
+ * reset (OCRnC), and the action to perform on compare match
+ * GTCCR:{COMnM1,COMnM0}).
  */
 static inline void setup_tcnt1_pwm(void)
 {
 	/* Count to OCR1C and reset */
 	GTCCR |= _BV(PWM1B);
-	OCR1C = 0xFF;
+	OCR1C = PWM_MAX;
 }
 
 static void setup_pwm(void)
@@ -372,15 +379,29 @@ static void update_pwm(const enum MODE mode, const bool fwd)
 	 */
 	cli();
 	scaler = pwm_scaler + (fwd ? 1 : -1);
-	if (mode == THREE_WIRE && scaler < 0)
-		scaler = 0;
-	duty_cycle = scaler * SCALER_INCR * adj / ADC_MAX;
-	prev_adj = adj;
-	sei();
 
 	/* Catch PWM overflow */
-	if (abs(duty_cycle) > 0xFF)
+	if (abs(scaler) > PWM_MAX / SCALER_INCR) {
+		sei();
 		return;
+	}
+
+	if (mode == THREE_WIRE && scaler < 0)
+		scaler = 0;
+
+	/*
+	 * There's some odd order-of-operations done here to avoid
+	 * 16-bit overflow. Unfortunately it also means it loses some
+	 * accuracy.
+	 */
+	duty_cycle = scaler * (SCALER_INCR * adj / ADC_MAX);
+	if (duty_cycle > PWM_MAX)
+		duty_cycle = PWM_MAX;
+	else if (duty_cycle < -PWM_MAX)
+		duty_cycle = -PWM_MAX;
+
+	prev_adj = adj;
+	sei();
 
 	/* Increment the scaler and set PWM compare match values */
 	cli();
@@ -412,10 +433,8 @@ static void update_pwm(const enum MODE mode, const bool fwd)
 
 ISR(PCINT0_vect)
 {
-	/* Clear pin change irq enable and schedule debouncing work */
-	GIMSK &= ~_BV(PCIE);
+	/* Schedule debouncing work */
 	irq_seen = true;
-	sei();
 }
 
 static void setup_irq(void)
@@ -432,6 +451,11 @@ static void handle_irq(const enum MODE mode)
 	bool fwd = get_fwd();
 	bool rev = get_rev();
 
+	/* Clear flag and detect transients */
+	irq_seen = false;
+	if (!fwd && !rev)
+		return;
+
 	/* The ADC takes a few cycles, so start it early */
 	start_adj_adc();
 
@@ -446,15 +470,9 @@ static void handle_irq(const enum MODE mode)
 	else if (rev && get_rev())
 		update_pwm(mode, 0);
 
-	/* Re-enable the pin change interrupt */
-	GIMSK |= _BV(PCIE);
-	irq_seen = false;
-
 	/* Stall 'button hold' behavior when switching directions */
-	if (is_stopped()) {
+	if (is_stopped())
 		_delay_ms(2000);
-		return;
-	}
 
 	/* Catch 'button hold' and reschedule isr */
 	debounce();
@@ -482,7 +500,7 @@ static inline void setup_mode_adc(void)
 	DIDR0 |= _BV(ADC2D);
 
 	/* Set internal pull-up */
-	PORTB |= OUT_FWD;
+	PORTB = IN_MODE;
 }
 
 /*
@@ -501,7 +519,7 @@ static inline void release_mode_adc(void)
 {
 	ADMUX &= ~_BV(MUX1);
 	DIDR0 &= ~_BV(ADC2D);
-	PORTB &= ~OUT_FWD;
+	PORTB &= ~IN_MODE;
 }
 
 /*
@@ -517,7 +535,9 @@ static inline void release_mode_adc(void)
  * soldered. In Three-Wire mode, this pin is used as a hard enable, and
  * won't be affected by the weak external resistor.
  */
-static enum MODE early_detect_mode(void) { enum MODE mode = TWO_WIRE;
+static enum MODE early_detect_mode(void)
+{
+	enum MODE mode = TWO_WIRE;
 
 	setup_mode_adc();
 	start_mode_adc();
@@ -533,7 +553,6 @@ static enum MODE early_detect_mode(void) { enum MODE mode = TWO_WIRE;
 
 static inline void relax(void)
 {
-	cli();
 	sleep_enable();
 	sei();
 	sleep_cpu(); /* Blocks until done sleeping */
@@ -549,16 +568,22 @@ int main(void)
 	setup_adj_adc();
 	setup_irq();
 
-	/* The uC will remain in a low power mode until a pin change
-	 * interrupt is thrown. After servicing the interrupt and the
-	 * scheduled work, the uC will power back down to the low power
-	 * mode.
+	/*
+	 * When not driving, the uC will remain in a low power mode
+	 * until a pin change interrupt is thrown. After servicing the
+	 * interrupt and the scheduled work, the uC will power back down
+	 * to the low power mode.
 	 */
 	set_sleep_mode(SLEEP_MODE_PWR_DOWN);
 	while (1) {
 		if (irq_seen) {
 			handle_irq(mode);
 		}
-		relax();
+
+		/* Sleep when not driving */
+		cli();
+		if (!irq_seen && is_stopped())
+			relax();
+		sei();
 	}
 }
